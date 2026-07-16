@@ -128,6 +128,15 @@ endif
 ifeq ($(CONFIG_AMEBA_GPIO),y)
 AMEBA_FWLIB_SRCS += $(AMEBA_SOC)/fwlib/ram_common/ameba_gpio.c
 endif
+
+# UART register layer.  The UART driver (arch/.../common/ameba/ameba_uart.c)
+# calls the fwlib UART API, all of which resolves to the ROM symbol table; but
+# the ROM routines index the fwlib data tables (UART_DEV_TABLE, APBPeriph_UARTx)
+# which live in this RAM source and must be compiled in (--gc-sections drops
+# the unused DMA/monitor helpers).
+ifeq ($(CONFIG_AMEBA_UART),y)
+AMEBA_FWLIB_SRCS += $(AMEBA_SOC)/fwlib/ram_common/ameba_uart.c
+endif
 AMEBA_FWLIB_INC  = -mcmse \
                    -I$(TOPDIR)/arch/arm/src/common/ameba/sdk_shim \
                    -I$(AMEBA_SOC)/fwlib/include \
