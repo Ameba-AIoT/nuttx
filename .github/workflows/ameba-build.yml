@@ -1,0 +1,314 @@
+# ##############################################################################
+# .github/workflows/ameba-build.yml
+#
+# FORK-ONLY CI: quickly compile-check the Realtek Ameba (RTL872x WHC) boards
+# and publish the flashable firmware as a downloadable artifact.
+#
+# Why this exists: the upstream apache/nuttx CI builds hundreds of unrelated
+# boards and is far too slow for iterating on this fork.  This workflow builds
+# ONLY the Ameba boards below, so every push to your fork gets a fast pass/fail
+# compile signal.  It is NOT meant for the upstream PR -- keep it on your fork's
+# branch (dev/ameba) and never include this file in upstream PR commits.
+#
+# It uses the official NuttX CI container (kconfig / cmake / ninja / python all
+# preinstalled).  The Ameba SDK (shallow clone, pinned commit) and the Realtek
+# arm-none-eabi toolchain are fetched automatically by the board build itself
+# (ameba_sdk.mk + the Make.defs PREBUILD), so no extra setup is needed here.
+#
+# ┌───────────────────────────────────────────────────────────────────────┐
+# │ ADDING A NEW BOARD:  add one entry to the `matrix.include` list below.  │
+# │   - board: <boardname>   config: <defconfig>   name: <label>           │
+# │ That is the ONLY edit required -- everything else is board-agnostic.    │
+# └───────────────────────────────────────────────────────────────────────┘
+# ##############################################################################
+
+name: Ameba boards (RTL872x WHC)
+
+on:
+  push:
+    paths-ignore:
+      - '**/*.md'
+      - 'wiki/**'
+      - 'Documentation/**'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'wiki/**'
+      - 'Documentation/**'
+  workflow_dispatch:
+
+# Cancel an in-progress run when a newer commit is pushed to the same ref, so
+# stale builds don't waste CI time and you always get feedback on the latest.
+concurrency:
+  group: ameba-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Standard NuttX coding-style gate (nxstyle / checkpatch), scoped to just
+  # this branch's own commits so it is fast.  Runs the SAME tools/checkpatch.sh
+  # the upstream "Check" workflow uses, so a green here means a green there.
+  check:
+    name: check (nxstyle / checkpatch)
+    runs-on: ubuntu-latest
+    container: ghcr.io/apache/nuttx/apache-nuttx-ci-linux:latest
+
+    steps:
+      - name: Checkout nuttx
+        uses: actions/checkout@v4
+        with:
+          path: nuttx
+          fetch-depth: 0        # full history so merge-base with upstream works
+
+      - name: checkpatch (this branch's changes only)
+        run: |
+          cd nuttx
+          git config --global --add safe.directory '*'
+          # Diff against the merge-base with apache/master, so only the commits
+          # this branch adds are style-checked (not the whole tree).
+          git remote add apache https://github.com/apache/nuttx.git 2>/dev/null || true
+          git fetch --quiet apache master
+          base=$(git merge-base HEAD apache/master)
+          echo "Checking range: $base..HEAD"
+          git --no-pager log --oneline "$base"..HEAD
+          ./tools/checkpatch.sh -g "$base"..HEAD
+
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container: ghcr.io/apache/nuttx/apache-nuttx-ci-linux:latest
+
+    strategy:
+      fail-fast: false          # one board failing must not cancel the others
+      matrix:
+        include:
+          # ---- Ameba boards x build method (add a board -> add its make and
+          #      cmake rows) --------------------------------------------------
+          - board: pke8721daf
+            config: nsh
+            method: make
+            name: "RTL8721Dx / pke8721daf : nsh (make)"
+          - board: pke8721daf
+            config: nsh
+            method: cmake
+            name: "RTL8721Dx / pke8721daf : nsh (cmake)"
+          - board: rtl8720f_evb
+            config: nsh
+            method: make
+            name: "RTL8720F / rtl8720f_evb : nsh (make)"
+          - board: rtl8720f_evb
+            config: nsh
+            method: cmake
+            name: "RTL8720F / rtl8720f_evb : nsh (cmake)"
+          # -------------------------------------------------------------------
+
+    steps:
+      - name: Checkout nuttx
+        uses: actions/checkout@v4
+        with:
+          path: nuttx
+
+      - name: Checkout nuttx-apps
+        uses: actions/checkout@v4
+        with:
+          repository: apache/nuttx-apps
+          path: nuttx-apps
+
+      # The Ameba SDK's env.sh creates a python venv (.venv) and pip-installs
+      # its tool requirements (json5, click, ... used by the image packaging
+      # axf2bin step).  The NuttX CI container ships system python but not the
+      # venv module, so `python -m venv` fails (no ensurepip) and the SDK falls
+      # back to a broken venv.  Install python3-venv so the SDK venv is created
+      # properly.  (Container steps run as root -- no sudo.)
+      - name: Install Ameba SDK host prerequisites
+        run: |
+          apt-get update
+          apt-get install -y python3-venv python3-pip
+
+      - name: Configure and build ${{ matrix.board }}:${{ matrix.config }} (${{ matrix.method }})
+        shell: bash          # need bash for `set -o pipefail`; container default is dash
+        run: |
+          cd nuttx
+          if [ "${{ matrix.method }}" = "cmake" ]; then
+            # CMake probes the compiler at configure time, so the Ameba asdk
+            # toolchain must be on PATH before `cmake`.  env.sh resolves it
+            # (fetching the SDK + toolchain + prebuilts on this fresh runner)
+            # exactly as a developer runs it.  Disable errexit/pipefail while
+            # sourcing: env.sh uses `sed ... | head -1`, whose SIGPIPE would
+            # otherwise trip `-eo pipefail`.
+            set +e +o pipefail
+            . tools/ameba/env.sh ${{ matrix.board }}
+            set -e -o pipefail
+            cmake -B build -DBOARD_CONFIG=${{ matrix.board }}:${{ matrix.config }} -GNinja
+            cmake --build build -j"$(nproc)"
+          else
+            # The make build auto-fetches everything via Make.defs PREBUILD, so
+            # sourcing env.sh is optional here -- left out on purpose to keep
+            # verifying the make path stays self-contained.
+            ./tools/configure.sh ${{ matrix.board }}:${{ matrix.config }}
+            make -j"$(nproc)"
+          fi
+
+      - name: Show build outputs
+        run: |
+          cd nuttx
+          # make writes nuttx.bin into the tree root; cmake into the build dir.
+          ls -la nuttx nuttx.bin *_image2_all.bin \
+                 build/nuttx build/nuttx.bin 2>/dev/null || true
+
+      - name: Upload firmware
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.board }}-${{ matrix.config }}-${{ matrix.method }}-firmware
+          path: |
+            nuttx/nuttx.bin
+            nuttx/nuttx
+            nuttx/build/nuttx.bin
+            nuttx/build/nuttx
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Exercise the developer operations a fresh-VM matrix build does NOT, for both
+  # build systems, everything except flashing: build + kconfig config, switching
+  # boards BOTH ways across the per-IC asdk boundary (10.3.1 <-> 12.3.1), and the
+  # abnormal cases (cmake: stale/absent env.sh caught by the guards; make: a
+  # board switch without 'make distclean' refused).
+  ops-cmake:
+    name: ops cmake (kconfig / board switch)
+    runs-on: ubuntu-latest
+    container: ghcr.io/apache/nuttx/apache-nuttx-ci-linux:latest
+    steps:
+      - name: Checkout nuttx
+        uses: actions/checkout@v4
+        with:
+          path: nuttx
+      - name: Checkout nuttx-apps
+        uses: actions/checkout@v4
+        with:
+          repository: apache/nuttx-apps
+          path: nuttx-apps
+      - name: Install Ameba SDK host prerequisites
+        run: |
+          apt-get update
+          apt-get install -y python3-venv python3-pip
+      - name: cmake ops — build / config / switch (normal + abnormal)
+        shell: bash
+        run: |
+          cd nuttx
+          # env.sh's PATH/vars only live within one run block, so every case
+          # lives here.  ok/fail helpers keep the asserts readable under set -e.
+          src()  { set +e +o pipefail; . tools/ameba/env.sh "$1"; set -e -o pipefail; }
+          want() { grep -rq "$1" "$2" || { echo "FAIL: expected $1 in $2"; exit 1; }; echo "OK: $3"; }
+
+          echo "::group::[1] build pke8721daf + kconfig backend (asdk 10.3.1)"
+          src pke8721daf
+          cmake -B b-dplus -DBOARD_CONFIG=pke8721daf:nsh -GNinja
+          # kconfig backend menuconfig uses (curses menuconfig needs a TTY, so
+          # exercise the non-interactive targets instead).
+          cmake --build b-dplus -t olddefconfig
+          cmake --build b-dplus -t savedefconfig
+          cmake --build b-dplus -j"$(nproc)"
+          test -f b-dplus/nuttx.bin || { echo "FAIL: no nuttx.bin"; exit 1; }
+          want "asdk-10.3.1" b-dplus/CMakeCache.txt "pke8721daf built with asdk-10.3.1"
+          echo "::endgroup::"
+
+          echo "::group::[2] switch pke8721daf -> rtl8720f_evb, build (asdk 12.3.1)"
+          src rtl8720f_evb
+          cmake -B b-8720f -DBOARD_CONFIG=rtl8720f_evb:nsh -GNinja
+          cmake --build b-8720f -j"$(nproc)"
+          test -f b-8720f/nuttx.bin || { echo "FAIL: no nuttx.bin"; exit 1; }
+          want "asdk-12.3.1" b-8720f/CMakeCache.txt "rtl8720f_evb built with asdk-12.3.1"
+          echo "::endgroup::"
+
+          echo "::group::[3] switch BACK rtl8720f_evb -> pke8721daf, build (asdk 10.3.1)"
+          # env.sh must move 10.3.1 back to the front of PATH (it strips stale
+          # asdk bins first), else cmake would still probe 12.3.1.
+          src pke8721daf
+          cmake -B b-dplus2 -DBOARD_CONFIG=pke8721daf:nsh -GNinja
+          cmake --build b-dplus2 -j"$(nproc)"
+          test -f b-dplus2/nuttx.bin || { echo "FAIL: no nuttx.bin"; exit 1; }
+          want "asdk-10.3.1" b-dplus2/CMakeCache.txt "switch-back built with asdk-10.3.1"
+          echo "::endgroup::"
+
+          echo "::group::[4] ABNORMAL stale env: 12.3.1 on PATH, configure pke8721daf must fail"
+          src rtl8720f_evb   # 12.3.1 now at the front
+          if cmake -B b-neg1 -DBOARD_CONFIG=pke8721daf:nsh -GNinja 2>n1.log; then
+            echo "FAIL: version guard did not fire"; cat n1.log; exit 1
+          fi
+          grep -q "is not asdk-10.3.1" n1.log \
+            || { echo "FAIL: wrong error"; cat n1.log; exit 1; }
+          echo "OK: version guard caught the stale environment"
+          echo "::endgroup::"
+
+          echo "::group::[5] ABNORMAL no env.sh: configure without the ameba toolchain must fail"
+          # Simulate a shell that never sourced env.sh by dropping the ameba asdk
+          # bins from PATH; the probe then finds only a stray system compiler.
+          noasdk=$(printf '%s' "$PATH" | tr ':' '\n' \
+                   | grep -v '/asdk-.*/linux/newlib/bin' | paste -sd:)
+          if env PATH="$noasdk" cmake -B b-neg2 -DBOARD_CONFIG=pke8721daf:nsh -GNinja 2>n2.log; then
+            echo "FAIL: toolchain guard did not fire"; cat n2.log; exit 1
+          fi
+          grep -qE "not the ameba asdk toolchain|env\.sh" n2.log \
+            || { echo "FAIL: wrong error"; cat n2.log; exit 1; }
+          echo "OK: toolchain guard caught the missing env.sh"
+          echo "::endgroup::"
+
+  ops-make:
+    name: ops make (distclean / board switch)
+    runs-on: ubuntu-latest
+    container: ghcr.io/apache/nuttx/apache-nuttx-ci-linux:latest
+    steps:
+      - name: Checkout nuttx
+        uses: actions/checkout@v4
+        with:
+          path: nuttx
+      - name: Checkout nuttx-apps
+        uses: actions/checkout@v4
+        with:
+          repository: apache/nuttx-apps
+          path: nuttx-apps
+      - name: Install Ameba SDK host prerequisites
+        run: |
+          apt-get update
+          apt-get install -y python3-venv python3-pip
+      - name: make ops — build / config / switch (normal + abnormal)
+        shell: bash
+        run: |
+          cd nuttx
+          # make resolves the per-IC asdk itself (toolchain.mk), so no env.sh;
+          # switching boards requires 'make distclean' between configs.
+
+          echo "::group::[1] configure pke8721daf + kconfig backend + build (10.3.1)"
+          ./tools/configure.sh pke8721daf:nsh
+          make olddefconfig        # kconfig backend (curses menuconfig needs a TTY)
+          make savedefconfig
+          make -j"$(nproc)"
+          test -f nuttx.bin || { echo "FAIL: no nuttx.bin"; exit 1; }
+          make distclean
+          echo "::endgroup::"
+
+          echo "::group::[2] switch pke8721daf -> rtl8720f_evb, build (auto 12.3.1)"
+          ./tools/configure.sh rtl8720f_evb:nsh
+          make -j"$(nproc)"
+          test -f nuttx.bin || { echo "FAIL: no nuttx.bin"; exit 1; }
+          make distclean
+          echo "::endgroup::"
+
+          echo "::group::[3] switch BACK rtl8720f_evb -> pke8721daf, build (auto 10.3.1)"
+          ./tools/configure.sh pke8721daf:nsh
+          make -j"$(nproc)"
+          test -f nuttx.bin || { echo "FAIL: no nuttx.bin"; exit 1; }
+          echo "::endgroup::"
+
+          echo "::group::[4] ABNORMAL switch without distclean must be refused"
+          # pke8721daf is still configured from [3]; configuring another board
+          # without 'make distclean' first must be refused.
+          if ./tools/configure.sh rtl8720f_evb:nsh 2>m.log; then
+            echo "FAIL: configure.sh accepted an already-configured tree"; cat m.log; exit 1
+          fi
+          echo "OK: configure.sh refused (must distclean first):"; cat m.log
+          make distclean
+          echo "::endgroup::"
